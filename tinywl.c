@@ -151,12 +151,16 @@ static void save_view_geometry(struct tinywl_view *view){
 	view->saved_geometry.width = view_geometry.width;
 }
 
-bool maximize_view(struct tinywl_view *view){
+bool maximize_view(struct tinywl_view *view, enum wlr_edges edge){
 	// Return false if the view is already maximized
 	if (view->xdg_surface->toplevel->current.maximized){
 		return false;
 	} else {
-		save_view_geometry(view);
+		/* Now that we can move from one maximized edge to another we don't want to
+		 * save the state in that case and just continue to use the old geometry */
+		if (view->server->cursor_mode != TINYWL_CURSOR_MOVE){
+			save_view_geometry(view);
+		};
 
         struct wlr_output *output =
             wlr_output_layout_output_at(view->server->output_layout,
@@ -168,6 +172,23 @@ bool maximize_view(struct tinywl_view *view){
 		y = 0;
 		width = output->width;
 		height = output->height;
+
+		switch (edge) {
+		case WLR_EDGE_LEFT:
+			width = output->width/2;
+			break;
+		case WLR_EDGE_RIGHT:
+			x = output->width/2;
+			width = output->width/2;
+			break;
+		case WLR_EDGE_BOTTOM:
+			y = output->height/2;
+			height = output->height/2;
+			break;
+		case WLR_EDGE_TOP:
+			height = output->height/2;
+			break;
+		}
 
 		view->x = x;
 		view->y = y;
@@ -194,7 +215,7 @@ bool unmaximize_view(struct tinywl_view *view){
 
 void toggle_maximize(struct tinywl_view *view){
     if (!unmaximize_view(view))
-		maximize_view(view);
+		maximize_view(view, WLR_EDGE_NONE);
 }
 
 static void keyboard_handle_modifiers(
@@ -394,14 +415,29 @@ static struct tinywl_view *desktop_view_at(
 
 static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
 	struct tinywl_view *view = server->grabbed_view;
+	struct wlr_output *output =
+		wlr_output_layout_output_at(view->server->output_layout,
+			view->server->cursor->x, view->server->cursor->y);
+	if (!output){ return; }
 
-	// Unmaximize the window if it is maximized.
-	unmaximize_view(view);
+	int edge_margin = 2;
+	if (server->cursor->x <= edge_margin)
+		maximize_view(view, WLR_EDGE_LEFT);
+	else if (server->cursor->x >= output->width - edge_margin)
+		maximize_view(view, WLR_EDGE_RIGHT);
+	else if (server->cursor->y >= output->height - edge_margin)
+		maximize_view(view, WLR_EDGE_BOTTOM);
+	else if (server->cursor->y <= edge_margin)
+		maximize_view(view, WLR_EDGE_TOP);
+	else{
+		// Unmaximize the window if it is maximized.
+		unmaximize_view(view);
 
-	/* Move the grabbed view to the new position. */
-	view->x = server->cursor->x - server->grab_x;
-	view->y = server->cursor->y - server->grab_y;
-	wlr_scene_node_set_position(view->scene_node, view->x, view->y);
+		/* Move the grabbed view to the new position. */
+		view->x = server->cursor->x - server->grab_x;
+		view->y = server->cursor->y - server->grab_y;
+		wlr_scene_node_set_position(view->scene_node, view->x, view->y);
+	}
 }
 
 static void process_cursor_resize(struct tinywl_server *server, uint32_t time) {
@@ -723,6 +759,9 @@ static void begin_interactive(struct tinywl_view *view,
 				focused_surface->pending.height, view->saved_geometry.height);
 			view->x = new_x;
             view->y = new_y;
+		} else {
+			// Save geometry before start of a move since we can maxmize with a move
+			save_view_geometry(view);
 		}
 		server->grab_x = server->cursor->x - view->x;
 		server->grab_y = server->cursor->y - view->y;
