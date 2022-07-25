@@ -30,6 +30,7 @@ enum tinywl_cursor_mode {
 	TINYWL_CURSOR_PASSTHROUGH,
 	TINYWL_CURSOR_MOVE,
 	TINYWL_CURSOR_RESIZE,
+	TINYWL_CURSOR_PRESSED,
 };
 
 struct tinywl_server {
@@ -406,14 +407,20 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
 	struct wlr_surface *surface = NULL;
 	struct tinywl_view *view = desktop_view_at(server,
 			server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-	if (!view) {
+	if (!view && server->cursor_mode != TINYWL_CURSOR_PRESSED) {
 		/* If there's no view under the cursor, set the cursor image to a
 		 * default. This is what makes the cursor image appear when you move it
 		 * around the screen, not over any views. */
 		wlr_xcursor_manager_set_cursor_image(
 				server->cursor_mgr, "left_ptr", server->cursor);
 	}
-	if (surface) {
+	if (server->cursor_mode == TINYWL_CURSOR_PRESSED && view != server->grabbed_view) {
+        // Send pointer events to the view which the mouse button is pressed on.
+		view = server->grabbed_view;
+        sx = server->cursor->x - view->x;
+		sy = server->cursor->y - view->y;
+        wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+	} else if (surface) {
 		/*
 		 * Send pointer enter and motion events.
 		 *
@@ -484,6 +491,10 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	} else {
 		/* Focus that client if the button was _pressed_ */
 		focus_view(view, surface);
+		if (view){
+			server->grabbed_view = view;
+			server->cursor_mode = TINYWL_CURSOR_PRESSED;
+		}
 	}
 }
 
