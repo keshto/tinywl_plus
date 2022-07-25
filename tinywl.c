@@ -218,6 +218,30 @@ void toggle_maximize(struct tinywl_view *view){
 		maximize_view(view, WLR_EDGE_NONE);
 }
 
+static void position_view_centered(struct tinywl_view *view){
+	int main_width, main_height;
+    if (view->xdg_surface->toplevel->parent){
+        struct wlr_box geo_box;
+        wlr_xdg_surface_get_geometry(view->xdg_surface->toplevel->parent, &geo_box);
+        main_width = geo_box.width;
+        main_height = geo_box.height;
+    } else {
+        struct wlr_output *output =
+        wlr_output_layout_output_at(view->server->output_layout,
+            view->server->cursor->x, view->server->cursor->y);
+        main_width = output->width;
+        main_height = output->height;
+    }
+
+    if (main_width){
+		struct wlr_box view_geometry;
+		wlr_xdg_surface_get_geometry(view->xdg_surface, &view_geometry);
+        view->x = main_width/2 - view_geometry.width/2;
+        view->y = main_height/2 - view_geometry.height/2;
+        wlr_scene_node_set_position(view->scene_node, view->x, view->y);
+    };
+}
+
 static void keyboard_handle_modifiers(
 		struct wl_listener *listener, void *data) {
 	/* This event is raised when a modifier key, such as shift or alt, is
@@ -693,6 +717,8 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	/* Called when the surface is mapped, or ready to display on-screen. */
 	struct tinywl_view *view = wl_container_of(listener, view, map);
+
+	position_view_centered(view);
 
 	wl_list_insert(&view->server->views, &view->link);
 
