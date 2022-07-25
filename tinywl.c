@@ -75,6 +75,10 @@ struct tinywl_output {
 	struct wl_listener frame;
 };
 
+struct previous_geo {
+	int x, y, width, height;
+};
+
 struct tinywl_view {
 	struct wl_list link;
 	struct tinywl_server *server;
@@ -85,6 +89,8 @@ struct tinywl_view {
 	struct wl_listener destroy;
 	struct wl_listener request_move;
 	struct wl_listener request_resize;
+	struct wl_listener request_maximize;
+	struct previous_geo saved_geometry;
 	int x, y;
 };
 
@@ -133,6 +139,62 @@ static void focus_view(struct tinywl_view *view, struct wlr_surface *surface) {
 	 */
 	wlr_seat_keyboard_notify_enter(seat, view->xdg_surface->surface,
 		keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
+}
+
+static void save_view_geometry(struct tinywl_view *view){
+	struct wlr_box view_geometry;
+	wlr_xdg_surface_get_geometry(view->xdg_surface, &view_geometry);
+
+	view->saved_geometry.x = view->x;
+	view->saved_geometry.y = view->y;
+	view->saved_geometry.height = view_geometry.height;
+	view->saved_geometry.width = view_geometry.width;
+}
+
+bool maximize_view(struct tinywl_view *view){
+	// Return false if the view is already maximized
+	if (view->xdg_surface->toplevel->current.maximized){
+		return false;
+	} else {
+		save_view_geometry(view);
+
+        struct wlr_output *output =
+            wlr_output_layout_output_at(view->server->output_layout,
+		        view->server->cursor->x, view->server->cursor->y);
+        if (!output){ return false; }
+
+		int x, y, width, height;
+		x = 0;
+		y = 0;
+		width = output->width;
+		height = output->height;
+
+		view->x = x;
+		view->y = y;
+		wlr_scene_node_set_position(view->scene_node, view->x, view->y);
+		wlr_xdg_toplevel_set_size(view->xdg_surface, width, height);
+        wlr_xdg_toplevel_set_maximized(view->xdg_surface, true);
+	}
+	return true;
+}
+
+bool unmaximize_view(struct tinywl_view *view){
+	// Return false if the view is not maximized
+	if (view->xdg_surface->toplevel->current.maximized){
+        view->x = view->saved_geometry.x;
+        view->y = view->saved_geometry.y;
+	    wlr_scene_node_set_position(view->scene_node, view->x, view->y);
+        wlr_xdg_toplevel_set_size(view->xdg_surface, view->saved_geometry.width, view->saved_geometry.height);
+        wlr_xdg_toplevel_set_maximized(view->xdg_surface, false);
+    } else {
+		return false;
+	}
+	return true;
+}
+
+void toggle_maximize(struct tinywl_view *view){
+    if (!unmaximize_view(view))
+		maximize_view(view);
 }
 
 static void keyboard_handle_modifiers(
@@ -331,8 +393,12 @@ static struct tinywl_view *desktop_view_at(
 }
 
 static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
-	/* Move the grabbed view to the new position. */
 	struct tinywl_view *view = server->grabbed_view;
+
+	// Unmaximize the window if it is maximized.
+	unmaximize_view(view);
+
+	/* Move the grabbed view to the new position. */
 	view->x = server->cursor->x - server->grab_x;
 	view->y = server->cursor->y - server->grab_y;
 	wlr_scene_node_set_position(view->scene_node, view->x, view->y);
@@ -488,6 +554,9 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	if (event->state == WLR_BUTTON_RELEASED) {
 		/* If you released any buttons, we exit interactive move/resize mode. */
 		server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
+
+		// The view might have changed (maximized) thus simulate move to update cursor
+        process_cursor_motion(server, event->time_msec);
 	} else {
 		/* Focus that client if the button was _pressed_ */
 		focus_view(view, surface);
@@ -610,8 +679,23 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&view->destroy.link);
 	wl_list_remove(&view->request_move.link);
 	wl_list_remove(&view->request_resize.link);
+	wl_list_remove(&view->request_maximize.link);
 
 	free(view);
+}
+
+/* This function is from labwc that calulates the view/window
+ * position under the mouse proportional to when it was maximized. */
+static int max_move_scale(double pos_cursor, double pos_current,
+	double size_current, double size_orig)
+{
+	double anchor_frac = (pos_cursor - pos_current) / size_current;
+	int pos_new = pos_cursor - (size_orig * anchor_frac);
+	if (pos_new < pos_current) {
+		/* Clamp by using the old offsets of the maximized window */
+		pos_new = pos_current;
+	}
+	return pos_new;
 }
 
 static void begin_interactive(struct tinywl_view *view,
@@ -631,6 +715,15 @@ static void begin_interactive(struct tinywl_view *view,
 	server->cursor_mode = mode;
 
 	if (mode == TINYWL_CURSOR_MOVE) {
+		if (view->xdg_surface->toplevel->current.maximized){
+			// Calculate where the window should be under the cursor
+			int new_x = max_move_scale(server->cursor->x, view->x,
+				focused_surface->pending.width, view->saved_geometry.width);
+            int new_y = max_move_scale(server->cursor->y, view->y,
+				focused_surface->pending.height, view->saved_geometry.height);
+			view->x = new_x;
+            view->y = new_y;
+		}
 		server->grab_x = server->cursor->x - view->x;
 		server->grab_y = server->cursor->y - view->y;
 	} else {
@@ -673,6 +766,11 @@ static void xdg_toplevel_request_resize(
 	struct wlr_xdg_toplevel_resize_event *event = data;
 	struct tinywl_view *view = wl_container_of(listener, view, request_resize);
 	begin_interactive(view, TINYWL_CURSOR_RESIZE, event->edges);
+}
+
+static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *data){
+	struct tinywl_view *view = wl_container_of(listener, view, request_maximize);
+    toggle_maximize(view);
 }
 
 static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
@@ -721,6 +819,8 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 	wl_signal_add(&toplevel->events.request_move, &view->request_move);
 	view->request_resize.notify = xdg_toplevel_request_resize;
 	wl_signal_add(&toplevel->events.request_resize, &view->request_resize);
+	view->request_maximize.notify = xdg_toplevel_request_maximize;
+	wl_signal_add(&toplevel->events.request_maximize, &view->request_maximize);
 }
 
 int main(int argc, char *argv[]) {
