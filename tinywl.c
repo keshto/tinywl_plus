@@ -839,8 +839,15 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 		calloc(1, sizeof(struct tinywl_view));
 	view->server = server;
 	view->xdg_surface = xdg_surface;
-	view->scene_node = wlr_scene_xdg_surface_create(
+	/* If the new surface has a parent create it as part of the parent. Doing
+	 * this will ensure that a dialog will be seen when it's parent is.*/
+    if (xdg_surface->toplevel->parent != 0) {
+        view->scene_node = wlr_scene_xdg_surface_create(
+			xdg_surface->toplevel->parent->data, view->xdg_surface);
+    } else {
+        view->scene_node = wlr_scene_xdg_surface_create(
 			&view->server->scene->node, view->xdg_surface);
+    }
 	view->scene_node->data = view;
 	xdg_surface->data = view->scene_node;
 
