@@ -95,6 +95,7 @@ struct tinywl_view {
 	struct wlr_xdg_surface *xdg_surface;
 	struct wlr_scene_node *scene_node;
 	struct wlr_scene_rect *decoration;
+	struct wlr_scene_rect *close_button;
 	struct title title;
 	struct wl_listener map;
 	struct wl_listener unmap;
@@ -121,6 +122,7 @@ enum decoration_type {
 	NONE,
 	TITLEBAR,
 	BORDER,
+	CLOSE_BUTTON,
 };
 
 // These are not runtime configurable yet so make them 'const's
@@ -130,11 +132,12 @@ typedef struct Global_config {
 	const int titlebar_padding;
 	const int border_size;
 	const int doubleclick_interval;
+	const int deco_button_size;
 	const float active_window_rgba[4];
 	const float inactive_window_rgba[4];
 }Global_config;
 const Global_config CONFIG = {
-		"Sans 12", 2, 2, 3, 500,
+		"Sans 12", 2, 2, 3, 500, 16,
 		{ 0.0f, 0.47f, 0.8f, 1.0f },
 		{ 0.33f, 0.33f, 0.33f, 1.0f }
 };
@@ -371,7 +374,7 @@ static struct text_buffer * create_text_buffer(struct tinywl_view *view,
 	view->title.original_width = width;
 
 	int pending_width =
-		view->xdg_surface->surface->current.width - CONFIG.border_size;
+		view->xdg_surface->surface->current.width - CONFIG.border_size  - CONFIG.deco_button_size;
 	if (pending_width > 0 && width > pending_width)
 		width = pending_width;
 	view->title.current_width = width;
@@ -667,13 +670,15 @@ static struct tinywl_view *desktop_view_at(
 
 	if (node->type == WLR_SCENE_NODE_RECT){
 		struct wlr_scene_rect *rect = (struct wlr_scene_rect *)node;
-		if (rect != view->decoration)
+		if (rect != view->decoration && rect != view->close_button)
 			return NULL;
 
 		if (*sx <= CONFIG.border_size || *sy <= CONFIG.border_size ||
 				*sx >= rect->width - CONFIG.border_size ||
 				*sy >= rect->height - CONFIG.border_size)
 			*decoration_type = BORDER;
+		else if (rect == view->close_button)
+			*decoration_type = CLOSE_BUTTON;
 		else
 			*decoration_type = TITLEBAR;
 	} else if (node->type == WLR_SCENE_NODE_BUFFER){
@@ -806,7 +811,8 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
 	struct tinywl_view *view = desktop_view_at(server,
 			server->cursor->x, server->cursor->y, &surface, &sx, &sy, &decoration_type);
 
-	if ((!view || decoration_type == TITLEBAR) && server->cursor_mode != TINYWL_CURSOR_PRESSED) {
+	if ((!view || decoration_type == TITLEBAR || decoration_type == CLOSE_BUTTON) &&
+			server->cursor_mode != TINYWL_CURSOR_PRESSED) {
 		/* If there's no view under the cursor, set the cursor image to a
 		 * default. This is what makes the cursor image appear when you move it
 		 * around the screen, not over any views. */
@@ -817,7 +823,7 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
             server->cursor_mgr, "move", server->cursor);
         server->seat->pointer_state.focused_surface = surface;
         begin_interactive(view, TINYWL_CURSOR_MOVE, 0);
-    }else if (decoration_type == BORDER){
+    } else if (decoration_type == BORDER){
         enum wlr_edges edge = find_resize_edge(view, surface);
         wlr_xcursor_manager_set_cursor_image(
             server->cursor_mgr, wlr_xcursor_get_resize_name(edge), server->cursor);
@@ -929,7 +935,9 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
             } else if (event->button == BTN_MIDDLE){
                 wlr_xdg_toplevel_send_close(view->xdg_surface);
             }
-        }
+        } else if (decoration_type == CLOSE_BUTTON){
+			wlr_xdg_toplevel_send_close(view->xdg_surface);
+		}
 
 		// The view might have changed (maximized) thus simulate move to update cursor
         process_cursor_motion(server, event->time_msec);
@@ -1083,9 +1091,9 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 	int pending_height = view->xdg_surface->pending.geometry.height;
 
 	// Only render a new title if the width of the view is different than title
-	if (pending_width < view->title.current_width ||
+	if (pending_width - CONFIG.deco_button_size < view->title.current_width ||
 			(view->title.current_width != view->title.original_width &&
-			view->title.current_width != pending_width - CONFIG.border_size)){
+			view->title.current_width != pending_width - CONFIG.border_size - CONFIG.deco_button_size)){
 		view_title_update(view, view->xdg_surface->toplevel->title);
 	}
 
@@ -1096,6 +1104,12 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
         wlr_scene_rect_set_size(view->decoration, pending_width + (CONFIG.border_size*2),
                 pending_height + TITLEBAR_HEIGHT + (CONFIG.border_size*2));
     }
+
+	if (view->close_button){
+		wlr_scene_node_set_position(&view->close_button->node,
+			view->xdg_surface->pending.geometry.width - view->close_button->width,
+			-TITLEBAR_HEIGHT + (TITLEBAR_HEIGHT - view->close_button->height -2)/2);
+	}
 }
 
 /* This function is from labwc that calulates the view/window
@@ -1227,10 +1241,15 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 		view_title_update(view, view->xdg_surface->toplevel->title);
 		view->decoration = wlr_scene_rect_create(
 			view->scene_node, 0, 0, CONFIG.inactive_window_rgba);
+		view->close_button = wlr_scene_rect_create(
+			view->scene_node, 0, 0, (float [4]){0.8f, 0.22f, 0.0f, 1.0f});
         wlr_scene_xdg_surface_create(view->scene_node, view->xdg_surface);
         // Set the decoration position. The size is handled by the commit handler
         wlr_scene_node_set_position(&view->decoration->node, -CONFIG.border_size,
 			-(TITLEBAR_HEIGHT + CONFIG.border_size));
+		int size = TITLEBAR_HEIGHT - CONFIG.border_size;
+		size = (size <= CONFIG.deco_button_size) ? size : CONFIG.deco_button_size;
+		wlr_scene_rect_set_size(view->close_button, size, size);
     }
 	view->scene_node->data = view;
 	xdg_surface->data = view->scene_node;
