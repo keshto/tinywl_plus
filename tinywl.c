@@ -27,6 +27,8 @@
 #include <wlr/util/log.h>
 #include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
+#include <pango/pangocairo.h>
+#include <drm_fourcc.h>
 
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
@@ -82,12 +84,18 @@ struct previous_geo {
 	int x, y, width, height;
 };
 
+struct title {
+	struct wlr_scene_buffer *buffer;
+	int original_width, current_width;
+};
+
 struct tinywl_view {
 	struct wl_list link;
 	struct tinywl_server *server;
 	struct wlr_xdg_surface *xdg_surface;
 	struct wlr_scene_node *scene_node;
 	struct wlr_scene_rect *decoration;
+	struct title title;
 	struct wl_listener map;
 	struct wl_listener unmap;
 	struct wl_listener destroy;
@@ -95,6 +103,7 @@ struct tinywl_view {
 	struct wl_listener request_move;
 	struct wl_listener request_resize;
 	struct wl_listener request_maximize;
+	struct wl_listener set_title;
 	struct previous_geo saved_geometry;
 	int x, y;
 };
@@ -116,18 +125,20 @@ enum decoration_type {
 
 // These are not runtime configurable yet so make them 'const's
 typedef struct Global_config {
+	char *font_description;
 	const int edge_margin;
+	const int titlebar_padding;
 	const int border_size;
 	const int doubleclick_interval;
 	const float active_window_rgba[4];
 	const float inactive_window_rgba[4];
 }Global_config;
 const Global_config CONFIG = {
-		2, 3, 500,
+		"Sans 12", 2, 2, 3, 500,
 		{ 0.0f, 0.47f, 0.8f, 1.0f },
 		{ 0.33f, 0.33f, 0.33f, 1.0f }
 };
-int TITLEBAR_HEIGHT = 32;
+int TITLEBAR_HEIGHT;
 
 // From hopalong, is there a better way?
 static struct tinywl_view *tinywl_view_from_wlr_surface(
@@ -267,6 +278,173 @@ bool unmaximize_view(struct tinywl_view *view){
 void toggle_maximize(struct tinywl_view *view){
     if (!unmaximize_view(view))
 		maximize_view(view, WLR_EDGE_NONE);
+}
+
+// Buffer logic from cagebreak
+struct text_buffer {
+	struct wlr_buffer base;
+	void *data;
+	uint32_t format;
+	size_t stride;
+};
+
+static void text_buffer_destroy(struct wlr_buffer *wlr_buffer) {
+	struct text_buffer *buffer = wl_container_of(wlr_buffer, buffer, base);
+	free(buffer->data);
+	free(buffer);
+}
+
+static bool text_buffer_begin_data_ptr_access(struct wlr_buffer *wlr_buffer,
+		uint32_t flags, void **data, uint32_t *format, size_t *stride) {
+	struct text_buffer *buffer = wl_container_of(wlr_buffer, buffer, base);
+	if(data != NULL) {
+		*data = (void *)buffer->data;
+	}
+	if(format != NULL) {
+		*format = buffer->format;
+	}
+	if(stride != NULL) {
+		*stride = buffer->stride;
+	}
+	return true;
+}
+
+static void text_buffer_end_data_ptr_access(struct wlr_buffer *wlr_buffer) {
+	// This space is intentionally left blank
+}
+
+static const struct wlr_buffer_impl text_buffer_impl = {
+	.destroy = text_buffer_destroy,
+	.begin_data_ptr_access = text_buffer_begin_data_ptr_access,
+	.end_data_ptr_access = text_buffer_end_data_ptr_access,
+};
+
+static struct text_buffer *text_buffer_create(uint32_t width, uint32_t height, uint32_t stride) {
+	struct text_buffer *buffer = calloc(1, sizeof(*buffer));
+	if (buffer == NULL) {
+		return NULL;
+	}
+
+	wlr_buffer_init(&buffer->base, &text_buffer_impl, width, height);
+	buffer->format = DRM_FORMAT_ARGB8888;
+	buffer->stride = stride;
+
+	buffer->data = malloc(buffer->stride * height);
+	if (buffer->data == NULL) {
+		free(buffer);
+		return NULL;
+	}
+
+	return buffer;
+}
+
+static void get_text_size(char *text, char *font_str, int *width, int *height){
+	cairo_surface_t *surface = cairo_image_surface_create(
+			CAIRO_FORMAT_ARGB32, 0, 0);
+	cairo_status_t status = cairo_surface_status(surface);
+
+	cairo_t *cr = cairo_create(surface);
+	PangoLayout *layout;
+	PangoFontDescription *desc;
+
+	/* Create Pango layout. */
+	layout = pango_cairo_create_layout (cr);
+	desc = pango_font_description_from_string (font_str);
+	pango_layout_set_font_description (layout, desc);
+	pango_font_description_free (desc);
+	pango_layout_set_text (layout, text, -1);
+	/* Set width and height to text size */
+	pango_layout_get_pixel_size(layout, width, height);
+
+	/* Cleanup */
+	cairo_surface_destroy(surface);
+	g_object_unref (layout);
+	cairo_destroy(cr);
+
+}
+
+static struct text_buffer * create_text_buffer(struct tinywl_view *view,
+		char* text) {
+	int width, height;
+	get_text_size(text, CONFIG.font_description, &width, &height);
+	TITLEBAR_HEIGHT = height + CONFIG.titlebar_padding * 2;
+	view->title.original_width = width;
+
+	int pending_width =
+		view->xdg_surface->surface->current.width - CONFIG.border_size;
+	if (pending_width > 0 && width > pending_width)
+		width = pending_width;
+	view->title.current_width = width;
+
+	cairo_surface_t *surface = cairo_image_surface_create(
+			CAIRO_FORMAT_ARGB32, width, height);
+	cairo_status_t status = cairo_surface_status(surface);
+	if (status != CAIRO_STATUS_SUCCESS) {
+		wlr_log(WLR_ERROR, "cairo_image_surface_create failed: %s",
+			cairo_status_to_string(status));
+		return NULL;
+	}
+
+	cairo_t *cr = cairo_create(surface);
+	PangoLayout *layout;
+	PangoFontDescription *desc;
+
+	/* Set background to be transparent */
+	cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
+	cairo_paint (cr);
+
+	/* Create Pango layout. */
+	layout = pango_cairo_create_layout (cr);
+	desc = pango_font_description_from_string (CONFIG.font_description);
+	pango_layout_set_font_description (layout, desc);
+	pango_font_description_free (desc);
+	pango_layout_set_text (layout, text, -1);
+	pango_layout_set_width (layout, width * PANGO_SCALE);
+	pango_layout_set_ellipsize (layout, PANGO_ELLIPSIZE_MIDDLE);
+
+	/* Draw layout. */
+	cairo_set_source_rgb (cr, 1.0, 1.0, 1.0);
+	pango_cairo_show_layout (cr, layout);
+
+	//---
+	unsigned char *data = cairo_image_surface_get_data(surface);
+	int stride = cairo_image_surface_get_stride(surface);
+	struct text_buffer *buf=text_buffer_create(width, height, stride);
+	void *data_ptr;
+
+	if(!wlr_buffer_begin_data_ptr_access(&buf->base, WLR_BUFFER_DATA_PTR_ACCESS_WRITE,
+			&data_ptr, NULL, NULL)) {
+		wlr_log(WLR_ERROR, "Failed to get pointer access to text buffer");
+		return NULL;
+	}
+	memcpy(data_ptr, data, stride*height);
+	wlr_buffer_end_data_ptr_access(&buf->base);
+	cairo_surface_destroy(surface);
+	//-----
+
+	/* free the layout object */
+	g_object_unref (layout);
+	cairo_destroy(cr);
+	return buf;
+}
+
+static void view_title_update(struct tinywl_view *view,
+		char* title_str){
+	if (view->title.buffer)
+		wlr_scene_node_destroy(&view->title.buffer->node);
+
+	struct text_buffer *buf = create_text_buffer(view, title_str);
+	struct wlr_scene_buffer *text_scene_buffer = malloc(sizeof(struct wlr_scene_buffer));
+	view->title.buffer = wlr_scene_buffer_create(view->scene_node, &buf->base);
+
+	wlr_scene_node_set_position(&view->title.buffer->node,
+		CONFIG.titlebar_padding,
+		CONFIG.titlebar_padding - TITLEBAR_HEIGHT);
+}
+
+static void xdg_toplevel_set_title(struct wl_listener *listener, void *data){
+	struct tinywl_view *view = wl_container_of(listener, view, set_title);
+    view_title_update(view, view->xdg_surface->toplevel->title);
 }
 
 static void position_view_centered(struct tinywl_view *view){
@@ -498,6 +676,11 @@ static struct tinywl_view *desktop_view_at(
 			*decoration_type = BORDER;
 		else
 			*decoration_type = TITLEBAR;
+	} else if (node->type == WLR_SCENE_NODE_BUFFER){
+		if ((struct wlr_scene_buffer *)node != view->title.buffer)
+			return NULL;
+
+		*decoration_type = TITLEBAR;
 	}
 	return topmost_node->data;
 }
@@ -888,6 +1071,7 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&view->request_move.link);
 	wl_list_remove(&view->request_resize.link);
 	wl_list_remove(&view->request_maximize.link);
+	wl_list_remove(&view->set_title.link);
 
 	free(view);
 }
@@ -897,6 +1081,13 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 
 	int pending_width = view->xdg_surface->pending.geometry.width;
 	int pending_height = view->xdg_surface->pending.geometry.height;
+
+	// Only render a new title if the width of the view is different than title
+	if (pending_width < view->title.current_width ||
+			(view->title.current_width != view->title.original_width &&
+			view->title.current_width != pending_width - CONFIG.border_size)){
+		view_title_update(view, view->xdg_surface->toplevel->title);
+	}
 
     // This needs to be done here otherwise the border/titlebar move faster/slower
     // than the surface when the size is changed thus causing a lag effect.
@@ -1033,6 +1224,7 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 			xdg_surface->toplevel->parent->data, view->xdg_surface);
     } else {
         view->scene_node = &wlr_scene_tree_create(&view->server->scene->node)->node;
+		view_title_update(view, view->xdg_surface->toplevel->title);
 		view->decoration = wlr_scene_rect_create(
 			view->scene_node, 0, 0, CONFIG.inactive_window_rgba);
         wlr_scene_xdg_surface_create(view->scene_node, view->xdg_surface);
@@ -1061,6 +1253,8 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 	wl_signal_add(&toplevel->events.request_resize, &view->request_resize);
 	view->request_maximize.notify = xdg_toplevel_request_maximize;
 	wl_signal_add(&toplevel->events.request_maximize, &view->request_maximize);
+	view->set_title.notify = xdg_toplevel_set_title;
+	wl_signal_add(&toplevel->events.set_title, &view->set_title);
 }
 
 int main(int argc, char *argv[]) {

@@ -3,6 +3,7 @@ WAYLAND_SCANNER=$(shell pkg-config --variable=wayland_scanner wayland-scanner)
 LIBS=\
 	 $(shell pkg-config --cflags --libs wlroots) \
 	 $(shell pkg-config --cflags --libs wayland-server) \
+	 $(shell pkg-config --cflags --libs pangocairo) \
 	 $(shell pkg-config --cflags --libs xkbcommon)
 
 # wayland-scanner is a tool which generates C headers and rigging for Wayland
