@@ -78,6 +78,7 @@ struct tinywl_output {
 	struct tinywl_server *server;
 	struct wlr_output *wlr_output;
 	struct wl_listener frame;
+	struct wlr_scene_rect *background;
 };
 
 struct previous_geo {
@@ -133,11 +134,13 @@ typedef struct Global_config {
 	const int border_size;
 	const int doubleclick_interval;
 	const int deco_button_size;
+	const float background_rgba[4];
 	const float active_window_rgba[4];
 	const float inactive_window_rgba[4];
 }Global_config;
 const Global_config CONFIG = {
 		"Sans 12", 2, 2, 3, 500, 16,
+		{ 0.2f, 0.2f, 0.25f, 1.0f },
 		{ 0.0f, 0.47f, 0.8f, 1.0f },
 		{ 0.33f, 0.33f, 0.33f, 1.0f }
 };
@@ -657,7 +660,18 @@ static struct tinywl_view *desktop_view_at(
 	struct wlr_scene_node *node, *topmost_node;
 	node = topmost_node = wlr_scene_node_at(
 		&server->scene->node, lx, ly, sx, sy);
-	if (node == NULL) {
+
+
+	struct wlr_output *wlr_output =
+        wlr_output_layout_output_at(server->output_layout, lx, ly);
+	struct tinywl_output *output;
+	wl_list_for_each(output, &server->outputs,link) {
+		if(output->wlr_output == wlr_output) {
+			break;
+		}
+	}
+
+	if (node == NULL || (struct wlr_scene_rect *)node == output->background) {
 		return NULL;
 	}
 	/* Find the node corresponding to the tinywl_view at the root of this
@@ -1034,6 +1048,11 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	output->frame.notify = output_frame;
 	wl_signal_add(&wlr_output->events.frame, &output->frame);
 	wl_list_insert(&server->outputs, &output->link);
+
+	output->background = wlr_scene_rect_create(
+		&server->scene->node,
+		output->wlr_output->width, output->wlr_output->height,
+		CONFIG.background_rgba);
 
 	/* Adds this to the output layout. The add_auto function arranges outputs
 	 * from left-to-right in the order they appear. A more sophisticated
