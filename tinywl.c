@@ -95,7 +95,8 @@ struct tinywl_view {
 	struct tinywl_server *server;
 	struct wlr_xdg_surface *xdg_surface;
 	struct wlr_scene_node *scene_node;
-	struct wlr_scene_rect *decoration;
+	struct wlr_scene_rect *border;
+	struct wlr_scene_rect *titlebar;
 	struct wlr_scene_rect *close_button;
 	struct title title;
 	struct wl_listener map;
@@ -119,11 +120,18 @@ struct tinywl_keyboard {
 	struct wl_listener key;
 };
 
-enum decoration_type {
+enum tinywl_node_type {
 	NONE,
 	TITLEBAR,
 	BORDER,
 	CLOSE_BUTTON,
+};
+
+struct tinywl_node_details {
+	enum tinywl_node_type type;
+	void *owner;
+	struct tinywl_view *view;
+	struct wl_listener destroy;
 };
 
 // These are not runtime configurable yet so make them 'const's
@@ -145,6 +153,32 @@ const Global_config CONFIG = {
 		{ 0.33f, 0.33f, 0.33f, 1.0f }
 };
 int TITLEBAR_HEIGHT;
+
+// Inspired from sway/labwc node.c/h
+static void node_destroy(struct tinywl_node_details *tinywl_node_details) {
+	wl_list_remove(&tinywl_node_details->destroy.link);
+	free(tinywl_node_details);
+}
+
+static void node_destroy_notify(struct wl_listener *listener, void *data) {
+	struct tinywl_node_details *tinywl_node_details =
+		wl_container_of(listener, tinywl_node_details, destroy);
+	node_destroy(tinywl_node_details);
+}
+
+struct tinywl_node_details *node_init(enum tinywl_node_type type, void *owner,
+		struct tinywl_view *view) {
+	struct tinywl_node_details *tinywl_node_details =
+		calloc(1, sizeof(struct tinywl_node_details));
+	tinywl_node_details->type = type;
+	tinywl_node_details->owner = owner;
+	tinywl_node_details->view = view;
+
+	tinywl_node_details->destroy.notify = node_destroy_notify;
+	wl_signal_add(&view->xdg_surface->events.destroy, &tinywl_node_details->destroy);
+
+	return tinywl_node_details;
+}
 
 // From hopalong, is there a better way?
 static struct tinywl_view *tinywl_view_from_wlr_surface(
@@ -185,8 +219,9 @@ static void focus_view(struct tinywl_view *view, struct wlr_surface *surface) {
 		/* Update the border to inactive color */
 		struct tinywl_view *focused_view = tinywl_view_from_wlr_surface(
 			server, prev_surface);
-		if (focused_view && focused_view->decoration){
-			wlr_scene_rect_set_color(focused_view->decoration, CONFIG.inactive_window_rgba);
+		if (focused_view && focused_view->border){
+			wlr_scene_rect_set_color(focused_view->border, CONFIG.inactive_window_rgba);
+			wlr_scene_rect_set_color(focused_view->titlebar, CONFIG.inactive_window_rgba);
 		}
 	}
 	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
@@ -197,8 +232,9 @@ static void focus_view(struct tinywl_view *view, struct wlr_surface *surface) {
 	/* Activate the new surface */
 	wlr_xdg_toplevel_set_activated(view->xdg_surface, true);
 	/* Update the border to active color */
-	if (view->decoration){
-		wlr_scene_rect_set_color(view->decoration, CONFIG.active_window_rgba);
+	if (view->border){
+		wlr_scene_rect_set_color(view->border, CONFIG.active_window_rgba);
+		wlr_scene_rect_set_color(view->titlebar, CONFIG.active_window_rgba);
 	}
 	/*
 	 * Tell the seat to have the keyboard enter this surface. wlroots will keep
@@ -442,6 +478,7 @@ static void view_title_update(struct tinywl_view *view,
 	struct text_buffer *buf = create_text_buffer(view, title_str);
 	struct wlr_scene_buffer *text_scene_buffer = malloc(sizeof(struct wlr_scene_buffer));
 	view->title.buffer = wlr_scene_buffer_create(view->scene_node, &buf->base);
+	view->title.buffer->node.data = node_init(TITLEBAR, (void *)&view->titlebar->node, view);
 
 	wlr_scene_node_set_position(&view->title.buffer->node,
 		CONFIG.titlebar_padding,
@@ -652,56 +689,32 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 	wlr_seat_set_selection(server->seat, event->source, event->serial);
 }
 
-static struct tinywl_view *desktop_view_at(
-		struct tinywl_server *server, double lx, double ly,
-		struct wlr_surface **surface, double *sx, double *sy,
-		enum decoration_type *decoration_type) {
+static struct tinywl_view *desktop_view_at(struct tinywl_server *server,
+		double lx, double ly, double *sx, double *sy,
+		struct tinywl_node_details **tinywl_node_details) {
 	/* This returns the topmost node in the scene at the given layout coords. */
-	struct wlr_scene_node *node, *topmost_node;
-	node = topmost_node = wlr_scene_node_at(
+	struct wlr_scene_node *node = wlr_scene_node_at(
 		&server->scene->node, lx, ly, sx, sy);
 
-
-	struct wlr_output *wlr_output =
-        wlr_output_layout_output_at(server->output_layout, lx, ly);
-	struct tinywl_output *output;
-	wl_list_for_each(output, &server->outputs,link) {
-		if(output->wlr_output == wlr_output) {
-			break;
-		}
+	if (node == NULL || (!node->data && node->type != WLR_SCENE_NODE_SURFACE)) {
+		return NULL;
+	} else if (node->type == WLR_SCENE_NODE_SURFACE){
+		//*surface = wlr_scene_surface_from_node(node)->surface;
+        /* Find the node corresponding to the tinywl_view at the root of this
+         * surface tree, it is the only one for which we set the data field. */
+        while (node != NULL && node->data == NULL) {
+                node = node->parent;
+        }
+        return node->data;
 	}
 
-	if (node == NULL || (struct wlr_scene_rect *)node == output->background) {
+	struct tinywl_node_details *details = node->data;
+	if (details){
+		*tinywl_node_details = details;
+		return details->view;
+	} else {
 		return NULL;
 	}
-	/* Find the node corresponding to the tinywl_view at the root of this
-	 * surface tree, it is the only one for which we set the data field. */
-	while (topmost_node != NULL && topmost_node->data == NULL) {
-		topmost_node = topmost_node->parent;
-	}
-	struct tinywl_view *view = topmost_node->data;
-	*surface = view->xdg_surface->surface;
-
-	if (node->type == WLR_SCENE_NODE_RECT){
-		struct wlr_scene_rect *rect = (struct wlr_scene_rect *)node;
-		if (rect != view->decoration && rect != view->close_button)
-			return NULL;
-
-		if (*sx <= CONFIG.border_size || *sy <= CONFIG.border_size ||
-				*sx >= rect->width - CONFIG.border_size ||
-				*sy >= rect->height - CONFIG.border_size)
-			*decoration_type = BORDER;
-		else if (rect == view->close_button)
-			*decoration_type = CLOSE_BUTTON;
-		else
-			*decoration_type = TITLEBAR;
-	} else if (node->type == WLR_SCENE_NODE_BUFFER){
-		if ((struct wlr_scene_buffer *)node != view->title.buffer)
-			return NULL;
-
-		*decoration_type = TITLEBAR;
-	}
-	return topmost_node->data;
 }
 
 static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
@@ -820,25 +833,28 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
 	/* Otherwise, find the view under the pointer and send the event along. */
 	double sx, sy;
 	struct wlr_seat *seat = server->seat;
-	struct wlr_surface *surface = NULL;
-	enum decoration_type decoration_type;
+	struct tinywl_node_details *tinywl_node_details = NULL;
 	struct tinywl_view *view = desktop_view_at(server,
-			server->cursor->x, server->cursor->y, &surface, &sx, &sy, &decoration_type);
+			server->cursor->x, server->cursor->y, &sx, &sy, &tinywl_node_details);
 
-	if ((!view || decoration_type == TITLEBAR || decoration_type == CLOSE_BUTTON) &&
-			server->cursor_mode != TINYWL_CURSOR_PRESSED) {
+	if ((!view || tinywl_node_details &&
+			(tinywl_node_details->type == TITLEBAR ||
+			tinywl_node_details->type == CLOSE_BUTTON) &&
+			server->cursor_mode != TINYWL_CURSOR_PRESSED)) {
 		/* If there's no view under the cursor, set the cursor image to a
 		 * default. This is what makes the cursor image appear when you move it
 		 * around the screen, not over any views. */
 		wlr_xcursor_manager_set_cursor_image(
 				server->cursor_mgr, "left_ptr", server->cursor);
-	} else if(decoration_type == TITLEBAR && server->cursor_mode == TINYWL_CURSOR_PRESSED){
+	} else if(tinywl_node_details &&
+			(tinywl_node_details->type == TITLEBAR &&
+			server->cursor_mode == TINYWL_CURSOR_PRESSED)){
         wlr_xcursor_manager_set_cursor_image(
             server->cursor_mgr, "move", server->cursor);
-        server->seat->pointer_state.focused_surface = surface;
+        server->seat->pointer_state.focused_surface = view->xdg_surface->surface;
         begin_interactive(view, TINYWL_CURSOR_MOVE, 0);
-    } else if (decoration_type == BORDER){
-        enum wlr_edges edge = find_resize_edge(view, surface);
+    } else if (tinywl_node_details && tinywl_node_details->type == BORDER){
+        enum wlr_edges edge = find_resize_edge(view, view->xdg_surface->surface);
         wlr_xcursor_manager_set_cursor_image(
             server->cursor_mgr, wlr_xcursor_get_resize_name(edge), server->cursor);
     }
@@ -849,7 +865,7 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
         sx = server->cursor->x - view->x;
 		sy = server->cursor->y - view->y;
         wlr_seat_pointer_notify_motion(seat, time, sx, sy);
-	} else if (surface) {
+	} else if (view && view->xdg_surface->surface) {
 		/*
 		 * Send pointer enter and motion events.
 		 *
@@ -861,10 +877,10 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
 		 * the surface has already has pointer focus or if the client is already
 		 * aware of the coordinates passed.
 		 */
-		if (decoration_type == NONE){
-            wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
+		if (!tinywl_node_details){
+            wlr_seat_pointer_notify_enter(seat, view->xdg_surface->surface, sx, sy);
             wlr_seat_pointer_notify_motion(seat, time, sx, sy);
-        } else if (decoration_type != NONE && server->cursor_mode != TINYWL_CURSOR_PRESSED){
+        } else if (tinywl_node_details && server->cursor_mode != TINYWL_CURSOR_PRESSED){
             wlr_seat_pointer_clear_focus(seat);
         }
 	} else {
@@ -933,40 +949,40 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	wlr_seat_pointer_notify_button(server->seat,
 			event->time_msec, event->button, event->state);
 	double sx, sy;
-	struct wlr_surface *surface = NULL;
-	enum decoration_type decoration_type;
+	struct tinywl_node_details *tinywl_node_details = NULL;
 	struct tinywl_view *view = desktop_view_at(server,
-			server->cursor->x, server->cursor->y, &surface, &sx, &sy, &decoration_type);
+			server->cursor->x, server->cursor->y, &sx, &sy, &tinywl_node_details);
+
 	if (event->state == WLR_BUTTON_RELEASED) {
 		/* If you released any buttons, we exit interactive move/resize mode. */
 		server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
 
 		// Handle button events on titlebar portion
 		int clicked = number_of_clicks(event->button, event->time_msec);
-        if (decoration_type == TITLEBAR){
+        if (tinywl_node_details && tinywl_node_details->type == TITLEBAR){
             if (event->button == BTN_LEFT && clicked == 2){
                 toggle_maximize(view);
             } else if (event->button == BTN_MIDDLE){
                 wlr_xdg_toplevel_send_close(view->xdg_surface);
             }
-        } else if (decoration_type == CLOSE_BUTTON){
+        } else if (tinywl_node_details && tinywl_node_details->type == CLOSE_BUTTON){
 			wlr_xdg_toplevel_send_close(view->xdg_surface);
 		}
 
 		// The view might have changed (maximized) thus simulate move to update cursor
         process_cursor_motion(server, event->time_msec);
 	} else {
-		/* Focus that client if the button was _pressed_ */
-		focus_view(view, surface);
 		if (view){
+			/* Focus that client if the button was _pressed_ */
+			focus_view(view, view->xdg_surface->surface);
 			server->grabbed_view = view;
-			if (decoration_type == BORDER){
+			if (tinywl_node_details && tinywl_node_details->type == BORDER){
 				/* If we are clicking the border, then the surface is pointer focus is
 			 	 * cleared and we need to manually set the focused surface without
 				 * calling an enter, which would change the cursor image. */
-                server->seat->pointer_state.focused_surface = surface;
+                server->seat->pointer_state.focused_surface = view->xdg_surface->surface;
                 begin_interactive(view, TINYWL_CURSOR_RESIZE,
-					find_resize_edge(view, surface));
+					find_resize_edge(view, view->xdg_surface->surface));
             } else {
                 server->cursor_mode = TINYWL_CURSOR_PRESSED;
             }
@@ -1118,16 +1134,18 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 
     // This needs to be done here otherwise the border/titlebar move faster/slower
     // than the surface when the size is changed thus causing a lag effect.
-    if (view->decoration && (pending_width != view->decoration->width ||
-            pending_height != view->decoration->height - TITLEBAR_HEIGHT - CONFIG.border_size)){
-        wlr_scene_rect_set_size(view->decoration, pending_width + (CONFIG.border_size*2),
+    if (view->border && (pending_width != view->border->width ||
+            pending_height != view->border->height - TITLEBAR_HEIGHT - CONFIG.border_size)){
+        wlr_scene_rect_set_size(view->border, pending_width + (CONFIG.border_size*2),
                 pending_height + TITLEBAR_HEIGHT + (CONFIG.border_size*2));
+		wlr_scene_rect_set_size(view->titlebar, pending_width,
+                TITLEBAR_HEIGHT);
     }
 
 	if (view->close_button){
 		wlr_scene_node_set_position(&view->close_button->node,
 			view->xdg_surface->pending.geometry.width - view->close_button->width,
-			-TITLEBAR_HEIGHT + (TITLEBAR_HEIGHT - view->close_button->height -2)/2);
+			TITLEBAR_HEIGHT/2 - view->close_button->height/2);
 	}
 }
 
@@ -1257,15 +1275,25 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 			xdg_surface->toplevel->parent->data, view->xdg_surface);
     } else {
         view->scene_node = &wlr_scene_tree_create(&view->server->scene->node)->node;
-		view_title_update(view, view->xdg_surface->toplevel->title);
-		view->decoration = wlr_scene_rect_create(
+		// Create the border
+		view->border = wlr_scene_rect_create(
 			view->scene_node, 0, 0, CONFIG.inactive_window_rgba);
+		view->border->node.data = node_init(BORDER, NULL, view);
+		// Create the titlebar and title text
+		view->titlebar = wlr_scene_rect_create(
+			&view->border->node, 0, 0, CONFIG.inactive_window_rgba);
+		view->titlebar->node.data = node_init(TITLEBAR, NULL, view);
+		view_title_update(view, view->xdg_surface->toplevel->title);
+		// Create the close button
 		view->close_button = wlr_scene_rect_create(
-			view->scene_node, 0, 0, (float [4]){0.8f, 0.22f, 0.0f, 1.0f});
+			&view->titlebar->node, 0, 0, (float [4]){0.8f, 0.22f, 0.0f, 1.0f});
+		view->close_button->node.data = node_init(CLOSE_BUTTON, NULL, view);
         wlr_scene_xdg_surface_create(view->scene_node, view->xdg_surface);
         // Set the decoration position. The size is handled by the commit handler
-        wlr_scene_node_set_position(&view->decoration->node, -CONFIG.border_size,
+        wlr_scene_node_set_position(&view->border->node, -CONFIG.border_size,
 			-(TITLEBAR_HEIGHT + CONFIG.border_size));
+		wlr_scene_node_set_position(&view->titlebar->node, CONFIG.border_size,
+			CONFIG.border_size);
 		int size = TITLEBAR_HEIGHT - CONFIG.border_size;
 		size = (size <= CONFIG.deco_button_size) ? size : CONFIG.deco_button_size;
 		wlr_scene_rect_set_size(view->close_button, size, size);
