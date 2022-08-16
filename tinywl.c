@@ -67,6 +67,9 @@ struct tinywl_server {
 	double grab_x, grab_y;
 	struct wlr_box grab_geobox;
 	uint32_t resize_edges;
+	struct wlr_scene_tree *view_menu;
+	struct tinywl_view *opened_menu_view;
+	struct wlr_scene_rect *selected_menu_item;
 
 	struct wlr_output_layout *output_layout;
 	struct wl_list outputs;
@@ -125,12 +128,14 @@ enum tinywl_node_type {
 	TITLEBAR,
 	BORDER,
 	CLOSE_BUTTON,
+	MENU,
 };
 
 struct tinywl_node_details {
 	enum tinywl_node_type type;
 	void *owner;
 	struct tinywl_view *view;
+	int index;
 	struct wl_listener destroy;
 };
 
@@ -166,16 +171,19 @@ static void node_destroy_notify(struct wl_listener *listener, void *data) {
 	node_destroy(tinywl_node_details);
 }
 
-struct tinywl_node_details *node_init(enum tinywl_node_type type, void *owner,
-		struct tinywl_view *view) {
+struct tinywl_node_details *node_init(enum tinywl_node_type type,
+		void *owner, struct tinywl_view *view, int index) {
 	struct tinywl_node_details *tinywl_node_details =
 		calloc(1, sizeof(struct tinywl_node_details));
 	tinywl_node_details->type = type;
 	tinywl_node_details->owner = owner;
 	tinywl_node_details->view = view;
+	tinywl_node_details->index = index;
 
 	tinywl_node_details->destroy.notify = node_destroy_notify;
-	wl_signal_add(&view->xdg_surface->events.destroy, &tinywl_node_details->destroy);
+	if (view){
+		wl_signal_add(&view->xdg_surface->events.destroy, &tinywl_node_details->destroy);
+	} // For nodes that don't have a view (menu) this should be attached to something else
 
 	return tinywl_node_details;
 }
@@ -405,19 +413,7 @@ static void get_text_size(char *text, char *font_str, int *width, int *height){
 
 }
 
-static struct text_buffer * create_text_buffer(struct tinywl_view *view,
-		char* text) {
-	int width, height;
-	get_text_size(text, CONFIG.font_description, &width, &height);
-	TITLEBAR_HEIGHT = height + CONFIG.titlebar_padding * 2;
-	view->title.original_width = width;
-
-	int pending_width =
-		view->xdg_surface->surface->current.width - CONFIG.border_size  - CONFIG.deco_button_size;
-	if (pending_width > 0 && width > pending_width)
-		width = pending_width;
-	view->title.current_width = width;
-
+static struct text_buffer * create_text_buffer(char* text, int width, int height) {
 	cairo_surface_t *surface = cairo_image_surface_create(
 			CAIRO_FORMAT_ARGB32, width, height);
 	cairo_status_t status = cairo_surface_status(surface);
@@ -475,10 +471,22 @@ static void view_title_update(struct tinywl_view *view,
 	if (view->title.buffer)
 		wlr_scene_node_destroy(&view->title.buffer->node);
 
-	struct text_buffer *buf = create_text_buffer(view, title_str);
+	int width, height;
+	get_text_size(title_str, CONFIG.font_description, &width, &height);
+	TITLEBAR_HEIGHT = height + CONFIG.titlebar_padding * 2;
+	view->title.original_width = width;
+
+	int pending_width =
+		view->xdg_surface->surface->current.width - CONFIG.border_size  - CONFIG.deco_button_size;
+	if (pending_width > 0 && width > pending_width)
+		width = pending_width;
+	view->title.current_width = width;
+
+	struct text_buffer *buf = create_text_buffer(title_str, width, height);
 	struct wlr_scene_buffer *text_scene_buffer = malloc(sizeof(struct wlr_scene_buffer));
 	view->title.buffer = wlr_scene_buffer_create(view->scene_node, &buf->base);
-	view->title.buffer->node.data = node_init(TITLEBAR, (void *)&view->titlebar->node, view);
+	view->title.buffer->node.data = node_init(TITLEBAR,
+		(void *)&view->titlebar->node, view, 0);
 
 	wlr_scene_node_set_position(&view->title.buffer->node,
 		CONFIG.titlebar_padding,
@@ -690,11 +698,13 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 }
 
 static struct tinywl_view *desktop_view_at(struct tinywl_server *server,
-		double lx, double ly, double *sx, double *sy,
+		double lx, double ly, double *sx, double *sy, void **scene_node,
 		struct tinywl_node_details **tinywl_node_details) {
 	/* This returns the topmost node in the scene at the given layout coords. */
 	struct wlr_scene_node *node = wlr_scene_node_at(
 		&server->scene->node, lx, ly, sx, sy);
+
+	*scene_node = node;
 
 	if (node == NULL || (!node->data && node->type != WLR_SCENE_NODE_SURFACE)) {
 		return NULL;
@@ -711,6 +721,8 @@ static struct tinywl_view *desktop_view_at(struct tinywl_server *server,
 	struct tinywl_node_details *details = node->data;
 	if (details){
 		*tinywl_node_details = details;
+		if (!details->view && server->opened_menu_view)
+			return server->opened_menu_view;
 		return details->view;
 	} else {
 		return NULL;
@@ -833,13 +845,32 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
 	/* Otherwise, find the view under the pointer and send the event along. */
 	double sx, sy;
 	struct wlr_seat *seat = server->seat;
+	void *scene_node;
 	struct tinywl_node_details *tinywl_node_details = NULL;
 	struct tinywl_view *view = desktop_view_at(server,
-			server->cursor->x, server->cursor->y, &sx, &sy, &tinywl_node_details);
+			server->cursor->x, server->cursor->y, &sx, &sy,
+			&scene_node, &tinywl_node_details);
+
+	if (tinywl_node_details && tinywl_node_details->type == MENU){
+		wlr_xcursor_manager_set_cursor_image(
+			server->cursor_mgr, "left_ptr", server->cursor);
+        if (tinywl_node_details->owner &&
+				server->selected_menu_item != tinywl_node_details->owner){
+			if (server->selected_menu_item){
+				wlr_scene_rect_set_color(server->selected_menu_item, CONFIG.inactive_window_rgba);
+			}
+			wlr_scene_rect_set_color(tinywl_node_details->owner, CONFIG.active_window_rgba);
+			server->selected_menu_item = tinywl_node_details->owner;
+		}
+    } else if (server->selected_menu_item){
+		wlr_scene_rect_set_color(server->selected_menu_item, CONFIG.inactive_window_rgba);
+		server->selected_menu_item = NULL;
+	}
 
 	if ((!view || tinywl_node_details &&
 			(tinywl_node_details->type == TITLEBAR ||
-			tinywl_node_details->type == CLOSE_BUTTON) &&
+			tinywl_node_details->type == CLOSE_BUTTON ||
+			tinywl_node_details->type == MENU) &&
 			server->cursor_mode != TINYWL_CURSOR_PRESSED)) {
 		/* If there's no view under the cursor, set the cursor image to a
 		 * default. This is what makes the cursor image appear when you move it
@@ -949,13 +980,33 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	wlr_seat_pointer_notify_button(server->seat,
 			event->time_msec, event->button, event->state);
 	double sx, sy;
+	void *scene_node;
 	struct tinywl_node_details *tinywl_node_details = NULL;
 	struct tinywl_view *view = desktop_view_at(server,
-			server->cursor->x, server->cursor->y, &sx, &sy, &tinywl_node_details);
+			server->cursor->x, server->cursor->y, &sx, &sy,
+			&scene_node, &tinywl_node_details);
 
 	if (event->state == WLR_BUTTON_RELEASED) {
 		/* If you released any buttons, we exit interactive move/resize mode. */
 		server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
+
+		if (server->opened_menu_view){
+			if (tinywl_node_details && tinywl_node_details->type == MENU) {
+				switch(tinywl_node_details->index) {
+				case 0: // Toggle maximize
+					toggle_maximize(server->opened_menu_view);
+					break;
+
+				case 1: // Close
+					wlr_xdg_toplevel_send_close(server->opened_menu_view->xdg_surface);
+					break;
+				}
+			}
+
+			wlr_scene_node_set_enabled(&server->view_menu->node, false);
+			server->opened_menu_view = NULL;
+			return;
+		}
 
 		// Handle button events on titlebar portion
 		int clicked = number_of_clicks(event->button, event->time_msec);
@@ -964,7 +1015,13 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
                 toggle_maximize(view);
             } else if (event->button == BTN_MIDDLE){
                 wlr_xdg_toplevel_send_close(view->xdg_surface);
-            }
+            } else if (event->button == BTN_RIGHT){
+				wlr_scene_node_set_position(&server->view_menu->node,
+					server->cursor->x, server->cursor->y);
+				wlr_scene_node_set_enabled(&server->view_menu->node, true);
+				wlr_scene_node_raise_to_top(&server->view_menu->node);
+				server->opened_menu_view = view;
+			}
         } else if (tinywl_node_details && tinywl_node_details->type == CLOSE_BUTTON){
 			wlr_xdg_toplevel_send_close(view->xdg_surface);
 		}
@@ -972,6 +1029,10 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 		// The view might have changed (maximized) thus simulate move to update cursor
         process_cursor_motion(server, event->time_msec);
 	} else {
+		if (server->opened_menu_view){
+			return;
+		}
+
 		if (view){
 			/* Focus that client if the button was _pressed_ */
 			focus_view(view, view->xdg_surface->surface);
@@ -983,7 +1044,7 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
                 server->seat->pointer_state.focused_surface = view->xdg_surface->surface;
                 begin_interactive(view, TINYWL_CURSOR_RESIZE,
 					find_resize_edge(view, view->xdg_surface->surface));
-            } else {
+            } else if (event->button == BTN_LEFT) {
                 server->cursor_mode = TINYWL_CURSOR_PRESSED;
             }
 		}
@@ -1278,16 +1339,16 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 		// Create the border
 		view->border = wlr_scene_rect_create(
 			view->scene_node, 0, 0, CONFIG.inactive_window_rgba);
-		view->border->node.data = node_init(BORDER, NULL, view);
+		view->border->node.data = node_init(BORDER, NULL, view, 0);
 		// Create the titlebar and title text
 		view->titlebar = wlr_scene_rect_create(
 			&view->border->node, 0, 0, CONFIG.inactive_window_rgba);
-		view->titlebar->node.data = node_init(TITLEBAR, NULL, view);
+		view->titlebar->node.data = node_init(TITLEBAR, NULL, view, 0);
 		view_title_update(view, view->xdg_surface->toplevel->title);
 		// Create the close button
 		view->close_button = wlr_scene_rect_create(
 			&view->titlebar->node, 0, 0, (float [4]){0.8f, 0.22f, 0.0f, 1.0f});
-		view->close_button->node.data = node_init(CLOSE_BUTTON, NULL, view);
+		view->close_button->node.data = node_init(CLOSE_BUTTON, NULL, view, 0);
         wlr_scene_xdg_surface_create(view->scene_node, view->xdg_surface);
         // Set the decoration position. The size is handled by the commit handler
         wlr_scene_node_set_position(&view->border->node, -CONFIG.border_size,
@@ -1321,6 +1382,41 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 	wl_signal_add(&toplevel->events.request_maximize, &view->request_maximize);
 	view->set_title.notify = xdg_toplevel_set_title;
 	wl_signal_add(&toplevel->events.set_title, &view->set_title);
+}
+
+static struct wlr_scene_tree *generate_menu(struct tinywl_server *server){
+	const int margin = 5;
+	char *menu_items[] = {"Maximize Toggle", "Close"};
+	int menu_size = sizeof menu_items / sizeof *menu_items;
+
+	struct wlr_scene_tree *menu = wlr_scene_tree_create(&server->scene->node);
+	int width, height, largest_width = 0;
+	for (int i = 0; i < menu_size; i++) {
+		get_text_size(menu_items[i], CONFIG.font_description, &width, &height);
+		if (width > largest_width)
+			largest_width = width;
+	}
+
+	for (int i = 0; i < menu_size; i++) {
+		struct wlr_scene_rect *container = wlr_scene_rect_create(
+			&menu->node, largest_width + margin*2, height + margin*2,
+			CONFIG.inactive_window_rgba);
+		/* We added an index field to node_init to use to determine which menu item
+		   we click later. One could skip doing this and loop through and compare the node
+		   with the list of menu item nodes instead if so desired. */
+		container->node.data = node_init(MENU, NULL, NULL, i);
+		wlr_scene_node_set_position(&container->node, 0, (height + margin*2) * i);
+		struct text_buffer *buf = create_text_buffer(menu_items[i], largest_width, height);
+		struct wlr_scene_buffer *text_scene_buffer = malloc(sizeof(struct wlr_scene_buffer));
+		struct wlr_scene_buffer *bb = wlr_scene_buffer_create(&container->node, &buf->base);
+		bb->node.data = node_init(MENU, container, NULL, i);
+		wlr_scene_node_set_position(&bb->node, margin, margin);
+	}
+
+	wlr_scene_node_set_enabled(&menu->node, false);
+	server->opened_menu_view = NULL;
+	server->selected_menu_item = NULL;
+	return menu;
 }
 
 int main(int argc, char *argv[]) {
@@ -1482,6 +1578,9 @@ int main(int argc, char *argv[]) {
 		wl_display_destroy(server.wl_display);
 		return 1;
 	}
+
+	/* Generate menus */
+	server.view_menu = generate_menu(&server);
 
 	/* Set the WAYLAND_DISPLAY environment variable to our socket and run the
 	 * startup command if requested. */
