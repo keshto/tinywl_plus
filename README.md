@@ -13,7 +13,7 @@ A simple stacking wayland compositor based on tinywl. Where features can be appl
 
 ### Notes
 - Starting tinywl+ will get you a black screen so one might want to start using the `-s <application>` ie `./tinywl -s sakura` to have it start an application when it starts.
-- Would be nice to have [fcft](https://codeberg.org/dnkl/fcft) to render fonts so we can have titles in our titlebar.
+- Would be nice to have [fcft](https://codeberg.org/dnkl/fcft) to render fonts to be more lightweight.
 - GTK does not play well with server side decorations(SSD). However, we can sorta force it to behave with some hacks included in `gtk_fix.sh`.
 - Not as many protocols supported as [dwl](https://github.com/djpohly/dwl), but tinywl+ comes in lighter with lines of code(LOS) than dwl :)
 
