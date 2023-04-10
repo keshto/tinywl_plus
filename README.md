@@ -12,15 +12,14 @@ A simple stacking wayland compositor based on tinywl. Where features can be appl
 - Maybe have patch sets that are optional or larger in seperate patches.
 
 ### Notes
-- Starting tinywl+ will get you a black screen so one might want to start using the `-s <application>` ie `./tinywl -s sakura` to have it start an application when it starts.
-- Would be nice to have [fcft](https://codeberg.org/dnkl/fcft) to render fonts to be more lightweight.
-- GTK does not play well with server side decorations(SSD). However, we can sorta force it to behave with some hacks included in `gtk_fix.sh`.
-- Not as many protocols supported as [dwl](https://github.com/djpohly/dwl), but tinywl+ comes in lighter with lines of code(LOS) than dwl :)
+- Would be nice to have [fcft](https://codeberg.org/dnkl/fcft) to render fonts so we can have titlebars
+- It is recomended that you install alacritty with tinywl+ so that ounce in the compositor you can press just alt to open alacritty with a help message
+- Not as many protocols supported as [dwl](https://github.com/djpohly/dwl), but tinywl+ comes in lighter with lines of code (LOS) than dwl :)
 
 ### Build instructions and requirements
-The requirements and build instructions are much like they are for original tinywl. ie:
+The requirements and build instructions are much like they are for original tinywl except we use meson. ie:
 <br>Install these dependencies:
 - wlroots
 - wayland-protocols
 
-And run `make`.
+And run `meson build` followed by `ninja -C build` and then `ninja -C build install`.
